@@ -21,38 +21,45 @@ jobs:
           echo "=========== gene_based 目录 ==========="
           curl -sSL --max-time 60 https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/ || echo "目录列出失败"
 
-      # 第二步：下载基序-转录因子注释表（很小，几 MB）
+      # 第二步：下载基序-转录因子注释表
+      # 文件名不是旧的 motifAnnotations_hgnc_v9.tbl；
+      # v10_clust 基序库配套的是 motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
       - name: 下载基序注释表
         run: |
-          curl -fL --retry 3 --retry-delay 5 -o motifAnnotations_hgnc_v9.tbl \
-            https://resources.aertslab.org/cistarget/motif2tf/motifAnnotations_hgnc_v9.tbl \
-            && echo "v9 注释表下载成功" || echo "v9 注释表下载失败"
-          curl -fL --retry 3 --retry-delay 5 -o motifAnnotations_hgnc_v10.tbl \
-            https://resources.aertslab.org/cistarget/motif2tf/motifAnnotations_hgnc_v10.tbl \
-            && echo "v10 注释表下载成功" || echo "v10 注释表不存在，跳过"
+          curl -fL --retry 3 --retry-delay 5 -o motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl \
+            https://resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+          ls -lh *.tbl
 
-      # 第三步：下载基序排名数据库（约 1 GB，最耗时）
+      # 第三步：下载基序排名数据库（约 300 MB）以及官方 sha1 校验文件
       - name: 下载基序排名数据库
         run: |
           curl -fL --retry 3 --retry-delay 10 --connect-timeout 60 \
             -o hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather \
             https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather
+          curl -fL --retry 3 --retry-delay 5 \
+            -o hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather.sha1sum.txt \
+            https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather.sha1sum.txt
           echo "数据库下载完成"
 
-      # 第四步：看看到底下到了什么、多大
+      # 第四步：核对校验和 + 看看到底下到了什么、多大
       - name: 检查下载结果
         run: |
-          echo "=========== 下载结果 ==========="
-          ls -lh
+          echo "=========== 官方校验文件 ==========="
+          cat *.sha1sum.txt || true
           echo ""
-          echo "=========== 文件类型 ==========="
-          file *.tbl *.feather 2>/dev/null || true
+          echo "=========== 实际校验值 ==========="
+          sha1sum *.feather || true
+          echo ""
+          echo "=========== 校验对比 ==========="
+          sha1sum -c *.sha1sum.txt || echo "校验不一致，请看上面两段对比"
+          echo ""
+          ls -lh
 
       # 第五步：发布成 Release，方便从国内下载
       - name: 发布到 Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: cistarget-v1
+          tag_name: cistarget-v2
           name: cisTarget 基序库
           body: |
             由 GitHub Actions 从 resources.aertslab.org 下载并转存。
@@ -61,3 +68,4 @@ jobs:
           files: |
             *.tbl
             *.feather
+            *.sha1sum.txt
