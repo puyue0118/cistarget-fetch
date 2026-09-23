@@ -1,0 +1,57 @@
+name: fetch-cistarget-split
+
+# 备用方案：Release 附件走的是未加速的新域名，速度只有 6 KB/s。
+# 改成把文件切块提交进仓库，用 git clone 走 github.com（已加速）取回。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 下载基序注释表
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl \
+            https://resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+          ls -lh *.tbl
+
+      - name: 下载基序排名数据库与官方校验文件
+        run: |
+          curl -fL --retry 3 --retry-delay 10 --connect-timeout 60 \
+            -o hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather \
+            https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather
+          curl -fL --retry 3 --retry-delay 5 \
+            -o hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather.sha1sum.txt \
+            https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather.sha1sum.txt
+
+      - name: 校验完整性（对不上就直接失败）
+        run: |
+          echo "官方校验值："
+          cat *.sha1sum.txt
+          echo "实际校验："
+          sha1sum -c *.sha1sum.txt
+
+      - name: 切块并提交到 data 分支
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b data
+          mkdir -p cistarget
+          # 297 MB 切成 75 MB 一块，四块，每块都在 GitHub 的 100 MB 限制之下
+          split -b 75M -d -a 2 hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather cistarget/rankings.feather.part-
+          mv motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl cistarget/
+          mv *.sha1sum.txt cistarget/
+          echo "=========== 要提交的文件 ==========="
+          ls -lh cistarget/
+          git add cistarget
+          git commit -m "add cisTarget databases, split into <100MB chunks"
+          git push origin data
+          echo "=========== 已推送到 data 分支 ==========="
