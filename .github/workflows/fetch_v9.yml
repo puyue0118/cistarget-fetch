@@ -1,0 +1,170 @@
+name: fetch-cistarget-v9
+
+# 目的：把原文（Lu 2022, Nat Commun 13:4594）用的 v9 基序库取回来。
+#   原文 Methods 写的是 cisTarget.hg38.mc9nr.feather + hgnc.v9.m0.001，
+#   也就是 v9 / mc9nr 那一套；而我们手上只有 v10_clust，属于方法偏离。
+#
+# 原理：resources.aertslab.org 从国内本机连不通，但 GitHub 的服务器能连。
+#       让 Actions 替我们下载，再通过「切块提交到分支 + git clone」取回本机
+#       （Release 附件那条路实测只有 6 KB/s，不可用）。
+#
+# 手动触发：仓库 Actions 页面 -> fetch-cistarget-v9 -> Run workflow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 第一步：先把服务器上到底有哪些文件列出来（自动识别真实文件名，
+      #         避免因为下划线数量记错而下载失败）
+      # ------------------------------------------------------------------
+      - name: 探测服务器上的可用文件
+        run: |
+          set -e
+          mkdir -p work
+          cd work
+
+          DB_DIR=https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/
+          ANN_DIR=https://resources.aertslab.org/cistarget/motif2tf/
+          TF_DIR=https://resources.aertslab.org/cistarget/tf_lists/
+
+          echo "=========== v9 数据库目录 ==========="
+          curl -sSL --max-time 120 "$DB_DIR" -o db.html && grep -oE 'href="[^"]+"' db.html | sed 's/href="//;s/"//' | grep -Ei 'feather|txt' || echo "目录列出失败"
+
+          echo ""
+          echo "=========== motif2tf 目录（只看 v9）==========="
+          curl -sSL --max-time 120 "$ANN_DIR" -o ann.html && grep -oE 'href="[^"]+"' ann.html | sed 's/href="//;s/"//' | grep -i 'v9' || echo "目录列出失败"
+
+          echo ""
+          echo "=========== tf_lists 目录 ==========="
+          curl -sSL --max-time 120 "$TF_DIR" -o tf.html && grep -oE 'href="[^"]+"' tf.html | sed 's/href="//;s/"//' | grep -i 'tf' || echo "目录列出失败"
+
+      # ------------------------------------------------------------------
+      # 第二步：下载 v9 的基序排名数据库（10kb 为主，500bp 为备用）
+      # ------------------------------------------------------------------
+      - name: 下载 v9 基序排名数据库
+        run: |
+          set -e
+          cd work
+          DB_DIR=https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/
+
+          # 从目录列表里挑出所有 rankings.feather（v9 里就是 mc9nr 的排名库）
+          grep -oE 'href="[^"]+"' db.html | sed 's/href="//;s/"//' > all_files.txt
+          grep -E 'rankings\.feather$' all_files.txt > rank_files.txt || true
+          echo "将要下载的排名库："; cat rank_files.txt
+
+          while read -r f; do
+            [ -z "$f" ] && continue
+            echo "---- 下载 $f ----"
+            curl -fL --retry 3 --retry-delay 10 --connect-timeout 60 -o "$f" "${DB_DIR}${f}"
+            # 官方校验文件（有就下，没有不报错）
+            curl -fL --retry 2 -o "${f}.sha1sum.txt" "${DB_DIR}${f}.sha1sum.txt" || true
+          done < rank_files.txt
+
+          echo "=========== 下载结果 ==========="
+          ls -lh
+
+      # ------------------------------------------------------------------
+      # 第三步：下载 v9 的基序注释表和 TF 列表
+      # ------------------------------------------------------------------
+      - name: 下载 v9 基序注释表与 TF 列表
+        run: |
+          set -e
+          cd work
+          ANN_DIR=https://resources.aertslab.org/cistarget/motif2tf/
+          TF_DIR=https://resources.aertslab.org/cistarget/tf_lists/
+
+          grep -oE 'href="[^"]+"' ann.html | sed 's/href="//;s/"//' | grep -i 'v9.*hgnc.*\.tbl$' > ann_files.txt || true
+          echo "将要下载的注释表："; cat ann_files.txt
+          while read -r f; do
+            [ -z "$f" ] && continue
+            echo "---- 下载 $f ----"
+            curl -fL --retry 3 --retry-delay 5 -o "$f" "${ANN_DIR}${f}"
+          done < ann_files.txt
+
+          # TF 列表（小而重要）
+          curl -fL --retry 3 -o allTFs_hg38.txt "${TF_DIR}allTFs_hg38.txt" || echo "allTFs_hg38.txt 下载失败"
+
+          echo "=========== 现在的文件 ==========="
+          ls -lh
+
+      # ------------------------------------------------------------------
+      # 第四步：校验完整性
+      # ------------------------------------------------------------------
+      - name: 校验完整性
+        run: |
+          cd work
+          echo "=========== 官方校验文件 ==========="
+          cat *.sha1sum.txt || true
+          echo ""
+          echo "=========== 实际校验值 ==========="
+          sha1sum *.feather || true
+          echo ""
+          echo "=========== 逐个核对 ==========="
+          for c in *.sha1sum.txt; do
+            [ -e "$c" ] || continue
+            sha1sum -c "$c" || echo "注意：$c 校验不一致"
+          done
+          echo ""
+          echo "=========== 文件类型 ==========="
+          file *.feather *.tbl *.txt || true
+
+      # ------------------------------------------------------------------
+      # 第五步：切块并提交到 v9data 分支（Release 附件下载太慢，走 git）
+      # ------------------------------------------------------------------
+      - name: 切块并提交到 v9data 分支
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # -B：如果分支已存在（上次跑过），直接重置，避免报错
+          git checkout -B v9data
+          mkdir -p cistarget_v9
+          # 每个 .feather 切成 75 MB 一块（GitHub 单文件硬上限 100 MB）
+          for f in work/*.feather; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ $(stat -c%s "$f") -gt 90000000 ]; then
+              split -b 75M -d -a 2 "$f" "cistarget_v9/${base}.part-"
+            else
+              cp "$f" "cistarget_v9/"
+            fi
+          done
+          # 只挑正式文件，别把中间产生的文件名清单也带进去
+          cp work/motifs-v9*.tbl     cistarget_v9/ 2>/dev/null || true
+          cp work/allTFs_hg38.txt    cistarget_v9/ 2>/dev/null || true
+          cp work/*.sha1sum.txt      cistarget_v9/ 2>/dev/null || true
+          echo "=========== 要提交的内容 ==========="
+          ls -lh cistarget_v9/
+          echo "总大小："; du -sh cistarget_v9
+          git add cistarget_v9
+          git commit -m "add cisTarget v9 (mc9nr) databases, split into <75MB chunks"
+          git push origin v9data
+          echo "=========== 已推送到 v9data 分支 ==========="
+
+      # ------------------------------------------------------------------
+      # 第六步：顺手也发布一个 Release（小文件可以走这条路，快）
+      # ------------------------------------------------------------------
+      - name: 发布小文件到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cistarget-v9
+          name: cisTarget v9 (mc9nr) 基序库
+          body: |
+            由 GitHub Actions 从 resources.aertslab.org 下载并转存。
+            对应 Lu 2022 (Nat Commun 13:4594) 用的 cisTarget.hg38.mc9nr + hgnc.v9.m0.001。
+            大文件（.feather）请从 v9data 分支取，Release 附件下载速度很慢。
+          fail_on_unmatched_files: false
+          files: |
+            work/*.tbl
+            work/*.txt
+            work/*.sha1sum.txt
