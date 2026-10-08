@@ -119,17 +119,29 @@ jobs:
           file *.feather *.tbl *.txt || true
 
       # ------------------------------------------------------------------
-      # 第五步：切块并提交到 v9data 分支（Release 附件下载太慢，走 git）
+      # 第五步：切块并【分批】提交到 v9data 分支
+      #
+      # 教训（第一次运行失败的原因）：
+      #   一次性把 2.5 GB 推上去，GitHub 直接返回 HTTP 500
+      #   （error: RPC failed; HTTP 500 / send-pack: unexpected disconnect）。
+      #   所以改成分批推：每批 4 个文件（约 300 MB），推一批再推下一批，
+      #   每批失败自动重试 3 次。
+      #
+      # 另外做了两层保险：
+      #   ① 先推「10kb 库 + 注释表」（原文用的那一套），这一部分失败就直接报错；
+      #   ② 再推 500bp 备用库，这一部分失败只警告、不让整个任务失败，
+      #      免得为了一个备选文件白跑。
       # ------------------------------------------------------------------
-      - name: 切块并提交到 v9data 分支
+      - name: 切块并分批推送到 v9data 分支
         run: |
-          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # -B：如果分支已存在（上次跑过），直接重置，避免报错
+          git config http.postBuffer 524288000
+          git config http.version HTTP/1.1
           git checkout -B v9data
           mkdir -p cistarget_v9
-          # 每个 .feather 切成 75 MB 一块（GitHub 单文件硬上限 100 MB）
+
+          # ---- 切块 ----
           for f in work/*.feather; do
             [ -e "$f" ] || continue
             base=$(basename "$f")
@@ -139,17 +151,76 @@ jobs:
               cp "$f" "cistarget_v9/"
             fi
           done
-          # 只挑正式文件，别把中间产生的文件名清单也带进去
-          cp work/motifs-v9*.tbl     cistarget_v9/ 2>/dev/null || true
-          cp work/allTFs_hg38.txt    cistarget_v9/ 2>/dev/null || true
-          cp work/*.sha1sum.txt      cistarget_v9/ 2>/dev/null || true
-          echo "=========== 要提交的内容 ==========="
-          ls -lh cistarget_v9/
-          echo "总大小："; du -sh cistarget_v9
-          git add cistarget_v9
-          git commit -m "add cisTarget v9 (mc9nr) databases, split into <75MB chunks"
-          git push origin v9data
-          echo "=========== 已推送到 v9data 分支 ==========="
+          cp work/motifs-v9*.tbl  cistarget_v9/ 2>/dev/null || true
+          cp work/allTFs_hg38.txt cistarget_v9/ 2>/dev/null || true
+          cp work/*.sha1sum.txt   cistarget_v9/ 2>/dev/null || true
+          echo "=========== 切块结果 ==========="
+          ls -lh cistarget_v9 | head -50
+          du -sh cistarget_v9
+
+          # ---- 分批推送函数 ----
+          FIRST_PUSH=1
+          push_files () {          # 用法：push_files 文件名列表（空格分隔）
+            local batch=($1)
+            local label=$2
+            [ ${#batch[@]} -eq 0 ] && return 0
+            for f in "${batch[@]}"; do git add "$f"; done
+            git commit -q -m "v9 data: $label" || true
+            for attempt in 1 2 3; do
+              if [ $FIRST_PUSH -eq 1 ]; then
+                git push -f origin v9data && { FIRST_PUSH=0; return 0; }
+              else
+                git push origin v9data && return 0
+              fi
+              echo "  push 第 $attempt 次失败，等 15 秒重试..."
+              sleep 15
+            done
+            echo "  !! $label 连续 3 次推送失败"
+            return 1
+          }
+
+          # ---- ① 先推 10kb 主库（原文用的）----
+          FILES=$(ls cistarget_v9/ | grep '10kb_up_and_down' | sort || true)
+          echo "=========== ① 推送 10kb 主库（共 $(echo "$FILES" | wc -l) 个文件）==========="
+          batch=""
+          n=0
+          for f in $FILES; do
+            batch="$batch cistarget_v9/$f"
+            n=$((n+1))
+            if [ $((n % 4)) -eq 0 ]; then
+              push_files "$batch" "10kb part $(($n/4))" || exit 1
+              batch=""
+            fi
+          done
+          push_files "$batch" "10kb tail" || exit 1
+
+          # ---- ①b 小文件（注释表、TF 列表、校验文件）----
+          SMALL=$(ls cistarget_v9/ | grep -E '\.tbl$|allTFs|sha1sum' | sort || true)
+          batch=""
+          for f in $SMALL; do batch="$batch cistarget_v9/$f"; done
+          push_files "$batch" "annotation table and TF list" || exit 1
+          echo "=========== ① 主库已推送完成 ==========="
+
+          # ---- ② 再推 500bp 备用库（失败只警告，不中断）----
+          FILES2=$(ls cistarget_v9/ | grep '500bp_up_and_100bp_down' | sort || true)
+          echo "=========== ② 推送 500bp 备用库（共 $(echo "$FILES2" | wc -l) 个文件）==========="
+          batch=""
+          n=0
+          ok2=1
+          for f in $FILES2; do
+            batch="$batch cistarget_v9/$f"
+            n=$((n+1))
+            if [ $((n % 4)) -eq 0 ]; then
+              push_files "$batch" "500bp part $(($n/4))" || { ok2=0; break; }
+              batch=""
+            fi
+          done
+          if [ $ok2 -eq 1 ]; then push_files "$batch" "500bp tail" || ok2=0; fi
+          if [ $ok2 -eq 0 ]; then
+            echo "::warning::500bp 备用库推送失败，但 10kb 主库已经推送成功，不影响使用"
+          fi
+
+          echo "=========== 全部完成：v9data 分支共 $(git rev-list --count v9data) 个提交 ==========="
 
       # ------------------------------------------------------------------
       # 第六步：顺手也发布一个 Release（小文件可以走这条路，快）
